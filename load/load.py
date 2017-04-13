@@ -156,28 +156,6 @@ class Owner:
         else:
             await self.bot.say("The cog has been unloaded.")
 
-    @unload.command(name="unload all")
-    @checks.serverowner_or_permissions(manage_server = True)
-    async def unload_all(self):
-        cogs = self._list_cogs()
-        still_loaded = []
-        for cog in cogs:
-            set_cog(cog, False)
-            try:
-                self._unload_cog(cog)
-            except OwnerUnloadWithoutReloadError:
-                pass
-            except CogUnloadError as e:
-                log.exception(e)
-                traceback.print_exc()
-                still_loaded.append(cog)
-        if still_loaded:
-            still_loaded = ", ".join(still_loaded)
-            await self.bot.say("I was unable to unload some cogs: "
-                "{}".format(still_loaded))
-        else:
-            await self.bot.say("All cogs are now unloaded.")
-
     @checks.serverowner_or_permissions(manage_server = True)
     @commands.command(name="re")
     async def _reload(self, *, cog_name: str):
@@ -206,13 +184,6 @@ class Owner:
             await self.disable_commands()
             await self.bot.say("The cog has been reloaded.")
 
-    @commands.command(name="loading")
-    async def help(self):
-        await self.bot.say("""```
-re          Reloads a cog
-l           Loads a cog
-ul          Unloads a cog```""")
-
     @commands.group(pass_context=True)
     @checks.serverowner_or_permissions(manage_server = True)
     async def c(self, ctx):
@@ -221,6 +192,7 @@ ul          Unloads a cog```""")
 
     @c.group(pass_context=True)
     async def repo(self, ctx):
+        """Repo managment"""
         if ctx.invoked_subcommand is None or \
                 isinstance(ctx.invoked_subcommand, commands.Group):
             await send_cmd_help(ctx)
@@ -228,6 +200,7 @@ ul          Unloads a cog```""")
 
     @repo.command(name="add", pass_context=True)
     async def _repo_add(self, ctx, repo_name: str, repo_url: str):
+        """Add a repository"""
         if not self.disclaimer_accepted:
             await self.bot.say(DISCLAIMER)
             answer = await self.bot.wait_for_message(timeout=30,
@@ -260,6 +233,8 @@ ul          Unloads a cog```""")
 
     @c.command(pass_context=True)
     async def update(self, ctx):
+        """Updates cogs"""
+
         tasknum = 0
         num_repos = len(self.repos)
 
@@ -268,8 +243,139 @@ ul          Unloads a cog```""")
         touch_n = tasknum
         touch_t = time()
 
+        def regulate(touch_t, touch_n):
+            dt = time() - touch_t
+            if dt + burst_inc*(touch_n) > min_dt:
+                touch_n = 0
+                touch_t = time()
+                return True, touch_t, touch_n
+            return False, touch_t, touch_n + 1
+
+        tasks = []
+        for r in self.repos:
+            task = partial(self.update_repo, r)
+            task = self.bot.loop.run_in_executor(self.executor, task)
+            tasks.append(task)
+
+        base_msg = "Downloading updated cogs, please wait... "
+        status = ' %d/%d repos updated' % (tasknum, num_repos)
+        msg = await self.bot.say(base_msg + status)
+
+        updated_cogs = []
+        new_cogs = []
+        deleted_cogs = []
+        failed_cogs = []
+        error_repos = {}
+        installed_updated_cogs = []
+
+        for f in as_completed(tasks):
+            tasknum += 1
+            try:
+                name, updates, oldhash = await f
+                if updates:
+                    if type(updates) is dict:
+                        for k, l in updates.items():
+                            tl = [(name, c, oldhash) for c in l]
+                            if k == 'A':
+                                new_cogs.extend(tl)
+                            elif k == 'D':
+                                deleted_cogs.extend(tl)
+                            elif k == 'M':
+                                updated_cogs.extend(tl)
+            except UpdateError as e:
+                name, what = e.args
+                error_repos[name] = what
+            edit, touch_t, touch_n = regulate(touch_t, touch_n)
+            if edit:
+                status = ' %d/%d repos updated' % (tasknum, num_repos)
+                msg = await self._robust_edit(msg, base_msg + status)
+        status = 'done. '
+
+        for t in updated_cogs:
+            repo, cog, _ = t
+            if self.repos[repo][cog]['INSTALLED']:
+                try:
+                    await self.install(repo, cog,
+                                       no_install_on_reqs_fail=False)
+                except RequirementFail:
+                    failed_cogs.append(t)
+                else:
+                    installed_updated_cogs.append(t)
+
+        for t in updated_cogs.copy():
+            if t in failed_cogs:
+                updated_cogs.remove(t)
+
+        if not any(self.repos[repo][cog]['INSTALLED'] for
+                   repo, cog, _ in updated_cogs):
+            status += ' No updates to apply. '
+
+        if new_cogs:
+            status += '\nNew cogs: ' \
+                   + ', '.join('%s/%s' % c[:2] for c in new_cogs) + '.'
+        if deleted_cogs:
+            status += '\nDeleted cogs: ' \
+                   + ', '.join('%s/%s' % c[:2] for c in deleted_cogs) + '.'
+        if updated_cogs:
+            status += '\nUpdated cogs: ' \
+                   + ', '.join('%s/%s' % c[:2] for c in updated_cogs) + '.'
+        if failed_cogs:
+            status += '\nCogs that got new requirements which have ' + \
+                   'failed to install: ' + \
+                   ', '.join('%s/%s' % c[:2] for c in failed_cogs) + '.'
+        if error_repos:
+            status += '\nThe following repos failed to update: '
+            for n, what in error_repos.items():
+                status += '\n%s: %s' % (n, what)
+
+        msg = await self._robust_edit(msg, base_msg + status)
+
+        if not installed_updated_cogs:
+            return
+
+        patchnote_lang = 'Prolog'
+        shorten_by = 8 + len(patchnote_lang)
+        for note in self.patch_notes_handler(installed_updated_cogs):
+            if note is None:
+                continue
+            for page in pagify(note, delims=['\n'], shorten_by=shorten_by):
+                await self.bot.say(box(page, patchnote_lang))
+
+        await self.bot.say("Cogs updated. Reload updated cogs? (yes/no)")
+        answer = await self.bot.wait_for_message(timeout=15,
+                                                 author=ctx.message.author)
+        if answer is None:
+            await self.bot.say("Ok then, you can reload cogs with"
+                               " `{}reload <cog_name>`".format(ctx.prefix))
+        elif answer.content.lower().strip() == "yes":
+            registry = dataIO.load_json("data/red/cogs.json")
+            update_list = []
+            fail_list = []
+            for repo, cog, _ in installed_updated_cogs:
+                if not registry.get('cogs.' + cog, False):
+                    continue
+                try:
+                    self.bot.unload_extension("cogs." + cog)
+                    self.bot.load_extension("cogs." + cog)
+                    update_list.append(cog)
+                except:
+                    fail_list.append(cog)
+            msg = 'Done.'
+            if update_list:
+                msg += " The following cogs were reloaded: "\
+                    + ', '.join(update_list) + "\n"
+            if fail_list:
+                msg += " The following cogs failed to reload: "\
+                    + ', '.join(fail_list)
+            await self.bot.say(msg)
+
+        else:
+            await self.bot.say("Ok then, you can reload cogs with"
+                               " `{}reload <cog_name>`".format(ctx.prefix))
+
     @c.command(name="install", pass_context=True)
     async def _install(self, ctx, repo_name: str, cog: str):
+        """Installs specified cog"""
         if repo_name not in self.repos:
             await self.bot.say("That repo doesn't exist.")
             return
@@ -366,6 +472,15 @@ ul          Unloads a cog```""")
             if hasattr(check, "__name__") and check.__name__ == "is_owner_check":
                 return False
         return comm_obj
+
+    async def _robust_edit(self, msg, text):
+        try:
+            msg = await self.bot.edit_message(msg, text)
+        except discord.errors.NotFound:
+            msg = await self.bot.send_message(msg.channel, text)
+        except:
+            raise
+        return msg
 
     def populate_list(self, name):
         valid_cogs = self.list_cogs(name)
